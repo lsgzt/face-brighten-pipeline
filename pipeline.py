@@ -5,7 +5,7 @@ import sys
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
-app = FastAPI(title="Portrait Complexion Lightening API", version="1.1.0")
+app = FastAPI(title="Portrait Complexion Lightening API", version="1.2.0")
 
 def get_skin_mask(image_bgr):
     try:
@@ -25,7 +25,7 @@ def get_skin_mask(image_bgr):
         
         skin_mask = cv2.bitwise_and(skin_mask, ellipse_mask)
         
-        # If mask is empty (e.g. extreme lighting or atypical pose), fallback to pure YCrCb skin mask
+        # Fallback if mask is too small
         if np.sum(skin_mask) < 500:
             skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
             
@@ -43,7 +43,6 @@ def get_skin_mask(image_bgr):
     except Exception as e:
         print(f"Error in get_skin_mask: {e}", file=sys.stderr)
         traceback.print_exc()
-        # Fallback to full image mask if skin segmentation encounters any issue
         h, w, _ = image_bgr.shape
         return np.full((h, w), 128, dtype=np.uint8)
 
@@ -55,12 +54,23 @@ def lighten_complexion(image_bgr, lightness_boost=25.0, whitening_tone=10.0, smo
         mask_float = mask.astype(np.float32) / 255.0
         mask_float = np.stack([mask_float, mask_float, mask_float], axis=-1)
         
+        base_img = image_bgr.copy()
         if smooth_skin:
-            smoothed = cv2.bilateralFilter(image_bgr, d=7, sigmaColor=50, sigmaSpace=50)
-            base_img = image_bgr * (1.0 - 0.4 * mask_float) + smoothed * (0.4 * mask_float)
-            base_img = base_img.astype(np.uint8)
-        else:
-            base_img = image_bgr.copy()
+            try:
+                # To prevent OOM / 502 crash on Render 512MB RAM with large images,
+                # downscale for bilateral filtering if image dimensions are large
+                if h > 1200 or w > 1200:
+                    small = cv2.resize(image_bgr, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+                    smoothed_small = cv2.bilateralFilter(small, d=5, sigmaColor=30, sigmaSpace=30)
+                    smoothed = cv2.resize(smoothed_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    smoothed = cv2.bilateralFilter(image_bgr, d=5, sigmaColor=30, sigmaSpace=30)
+                
+                base_img = image_bgr * (1.0 - 0.3 * mask_float) + smoothed * (0.3 * mask_float)
+                base_img = base_img.astype(np.uint8)
+            except Exception as sm_err:
+                print(f"Skin smoothing warning (falling back to unsmoothed base): {sm_err}", file=sys.stderr)
+                base_img = image_bgr.copy()
             
         lab = cv2.cvtColor(base_img, cv2.COLOR_BGR2Lab)
         L, A, B = cv2.split(lab)
