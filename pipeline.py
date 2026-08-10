@@ -189,4 +189,4 @@ async def process_image(
             
         return Response(content=encoded_img.tobytes(), media_type="image/jpeg")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) 
