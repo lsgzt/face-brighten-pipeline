@@ -1,258 +1,171 @@
+"""Low-memory portrait complexion adjustment service.
+
+The service deliberately produces a web-sized result.  Processing camera originals at
+full resolution is the main cause of memory failures on small (512 MB) instances.
+"""
+import io
+import os
+import sys
+import traceback
+from contextlib import suppress
+
 import cv2
 import numpy as np
-import traceback
-import sys
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response, HTMLResponse
+from PIL import Image, UnidentifiedImageError
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, Response
 
-app = FastAPI(title="Portrait Complexion Lightening API", version="1.2.0")
+# These are deliberately conservative for a 512 MB Render instance.  A 1600x1000
+# BGR image is about 4.8 MB; all OpenCV/Numpy working buffers then remain modest.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 12 * 1024 * 1024))
+MAX_DECODE_PIXELS = int(os.getenv("MAX_DECODE_PIXELS", 12_000_000))
+MAX_PROCESS_PIXELS = int(os.getenv("MAX_PROCESS_PIXELS", 1_600_000))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", 88))
 
-def get_skin_mask(image_bgr):
-    try:
-        h, w, _ = image_bgr.shape
-        
-        # 1. YCrCb Color-based skin segmentation
+# Avoid OpenCV allocating several large thread-local workspaces on a small instance.
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
+Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
+
+app = FastAPI(title="Portrait Complexion Lightening API", version="2.0.0")
+
+
+def _web_size(image: np.ndarray) -> np.ndarray:
+    """Downscale before *any* expensive processing, preserving aspect ratio."""
+    height, width = image.shape[:2]
+    pixels = height * width
+    if pixels <= MAX_PROCESS_PIXELS:
+        return image
+    scale = (MAX_PROCESS_PIXELS / pixels) ** 0.5
+    new_width = max(1, int(width * scale))
+    new_height = max(1, int(height * scale))
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def get_skin_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """Return a feathered, single-channel skin mask using in-place operations."""
+    height, width = image_bgr.shape[:2]
+    ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
+    lower = np.array([0, 133, 77], dtype=np.uint8)
+    upper = np.array([255, 173, 127], dtype=np.uint8)
+    mask = cv2.inRange(ycrcb, lower, upper)
+    del ycrcb
+
+    # Prefer the central portrait region, but fall back for off-centre portraits.
+    ellipse = np.zeros((height, width), dtype=np.uint8)
+    cv2.ellipse(ellipse, (width // 2, int(height * 0.45)),
+                (int(width * 0.35), int(height * 0.45)), 0, 0, 360, 255, -1)
+    cv2.bitwise_and(mask, ellipse, dst=mask)
+    if cv2.countNonZero(mask) < 500:
+        # Recreate the threshold directly rather than retaining a second colour image.
         ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
-        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
-        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
-        
-        # 2. Centered Ellipse Prior
-        ellipse_mask = np.zeros((h, w), dtype=np.uint8)
-        center = (w // 2, int(h * 0.45))
-        axes = (int(w * 0.35), int(h * 0.45))
-        cv2.ellipse(ellipse_mask, center, axes, 0, 0, 360, 255, -1)
-        
-        skin_mask = cv2.bitwise_and(skin_mask, ellipse_mask)
-        
-        # Fallback if mask is too small
-        if np.sum(skin_mask) < 500:
-            skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
-            
-        # 3. Morphological cleanup
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel_large, iterations=1)
-        
-        # 4. Feather mask edges
-        skin_mask = cv2.GaussianBlur(skin_mask, (31, 31), 0)
-        
-        return skin_mask
-    except Exception as e:
-        print(f"Error in get_skin_mask: {e}", file=sys.stderr)
-        traceback.print_exc()
-        h, w, _ = image_bgr.shape
-        return np.full((h, w), 128, dtype=np.uint8)
+        cv2.inRange(ycrcb, lower, upper, dst=mask)
+        del ycrcb
+    del ellipse
 
-def lighten_complexion(image_bgr, lightness_boost=25.0, whitening_tone=10.0, smooth_skin=True):
+    small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    cv2.morphologyEx(mask, cv2.MORPH_OPEN, small, dst=mask)
+    cv2.morphologyEx(mask, cv2.MORPH_CLOSE, large, dst=mask)
+    # dst avoids allocating another full-resolution mask.
+    cv2.GaussianBlur(mask, (0, 0), 5, dst=mask)
+    return mask
+
+
+def lighten_complexion(image_bgr: np.ndarray, lightness_boost: float = 25.0,
+                       whitening_tone: float = 10.0, smooth_skin: bool = True) -> np.ndarray:
+    """Apply the effect using bounded-size, mostly single-channel temporary arrays."""
+    mask = get_skin_mask(image_bgr)
+
+    base = image_bgr
+    if smooth_skin:
+        # At the bounded processing size this is inexpensive; do not retain a full-size
+        # half-resolution/upscaled pair as the previous implementation did.
+        smoothed = cv2.bilateralFilter(image_bgr, d=5, sigmaColor=30, sigmaSpace=30)
+        softened = cv2.addWeighted(image_bgr, 0.70, smoothed, 0.30, 0)
+        base = image_bgr.copy()
+        # A masked copy is much cheaper than a 3-channel float alpha mask.
+        cv2.copyTo(softened, mask, base)
+        del smoothed, softened
+
+    lab = cv2.cvtColor(base, cv2.COLOR_BGR2Lab)
+    if base is not image_bgr:
+        del base
+
+    # One float mask (not the former HxWx3 float mask) is sufficient.
+    alpha = mask.astype(np.float32)
+    alpha *= 1.0 / 255.0
+    lightness = lab[:, :, 0].astype(np.float32)
+    lightness += lightness_boost * (1.0 - 0.4 * lightness / 255.0) * alpha
+    lab[:, :, 0] = np.clip(lightness, 0, 255).astype(np.uint8)
+    del lightness
+
+    tone = lab[:, :, 2].astype(np.float32)
+    tone -= (whitening_tone * 0.4) * alpha
+    lab[:, :, 2] = np.clip(tone, 0, 255).astype(np.uint8)
+    del tone
+
+    adjusted = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+    del lab
+
+    # Blend channel-by-channel, avoiding several HxWx3 float work arrays.
+    output = image_bgr.copy()
+    for channel in range(3):
+        blended = image_bgr[:, :, channel].astype(np.float32)
+        blended += (adjusted[:, :, channel].astype(np.float32) - blended) * alpha
+        output[:, :, channel] = np.clip(blended, 0, 255).astype(np.uint8)
+    return output
+
+
+def _validate_image_header(contents: bytes) -> None:
     try:
-        h, w, _ = image_bgr.shape
-        
-        mask = get_skin_mask(image_bgr)
-        mask_float = mask.astype(np.float32) / 255.0
-        mask_float = np.stack([mask_float, mask_float, mask_float], axis=-1)
-        
-        base_img = image_bgr.copy()
-        if smooth_skin:
-            try:
-                # To prevent OOM / 502 crash on Render 512MB RAM with large images,
-                # downscale for bilateral filtering if image dimensions are large
-                if h > 1200 or w > 1200:
-                    small = cv2.resize(image_bgr, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
-                    smoothed_small = cv2.bilateralFilter(small, d=5, sigmaColor=30, sigmaSpace=30)
-                    smoothed = cv2.resize(smoothed_small, (w, h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    smoothed = cv2.bilateralFilter(image_bgr, d=5, sigmaColor=30, sigmaSpace=30)
-                
-                base_img = image_bgr * (1.0 - 0.3 * mask_float) + smoothed * (0.3 * mask_float)
-                base_img = base_img.astype(np.uint8)
-            except Exception as sm_err:
-                print(f"Skin smoothing warning (falling back to unsmoothed base): {sm_err}", file=sys.stderr)
-                base_img = image_bgr.copy()
-            
-        lab = cv2.cvtColor(base_img, cv2.COLOR_BGR2Lab)
-        L, A, B = cv2.split(lab)
-        
-        L_float = L.astype(np.float32)
-        boost_map = lightness_boost * (1.0 - (L_float / 255.0) * 0.4)
-        L_adjusted = L_float + boost_map * mask_float[:, :, 0]
-        
-        B_float = B.astype(np.float32)
-        B_adjusted = B_float - (whitening_tone * 0.4) * mask_float[:, :, 0]
-        
-        L_adjusted = np.clip(L_adjusted, 0, 255).astype(np.uint8)
-        B_adjusted = np.clip(B_adjusted, 0, 255).astype(np.uint8)
-        
-        merged_lab = cv2.merge([L_adjusted, A, B_adjusted])
-        result_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_Lab2BGR)
-        
-        final_img = (image_bgr.astype(np.float32) * (1.0 - mask_float) + result_bgr.astype(np.float32) * mask_float)
-        final_img = np.clip(final_img, 0, 255).astype(np.uint8)
-        
-        return final_img
-    except Exception as e:
-        print(f"Error in lighten_complexion: {e}", file=sys.stderr)
-        traceback.print_exc()
-        raise e
+        with Image.open(io.BytesIO(contents)) as probe:
+            width, height = probe.size
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=400, detail="Upload a valid JPEG, PNG, or WebP image.") from exc
+    if width <= 0 or height <= 0 or width * height > MAX_DECODE_PIXELS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image is too large. Maximum decoded size is {MAX_DECODE_PIXELS:,} pixels.",
+        )
+
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Portrait Complexion Lightener - Testing UI</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; background: #f4f4f9; color: #333; }
-            .container { max-width: 900px; margin: auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-            h1 { font-size: 24px; margin-bottom: 10px; }
-            p { color: #666; }
-            .form-group { margin-bottom: 20px; }
-            label { display: block; font-weight: bold; margin-bottom: 5px; }
-            input[type="file"], input[type="number"], select { width: 100%; padding: 8px; box-sizing: border-box; }
-            button { background: #007BFF; color: white; border: none; padding: 10px 20px; font-size: 16px; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #0056b3; }
-            .results { margin-top: 30px; display: flex; gap: 20px; justify-content: space-around; flex-wrap: wrap; }
-            .result-box { text-align: center; max-width: 400px; }
-            img { max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; margin-top: 10px; }
-            #errorDiv { margin-top: 20px; padding: 15px; background: #ffe6e6; color: #cc0000; border: 1px solid #ff9999; border-radius: 4px; white-space: pre-wrap; display: none; font-family: monospace; font-size: 13px; }
-            #loading { display: none; margin-top: 15px; font-weight: bold; color: #007BFF; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Portrait Complexion Lightener</h1>
-            <p>Upload a portrait photo to test the selective complexion-lightening pipeline.</p>
-            
-            <form id="uploadForm">
-                <div class="form-group">
-                    <label>Select Portrait Image:</label>
-                    <input type="file" id="fileInput" name="file" accept="image/*" required>
-                </div>
-                <div class="form-group">
-                    <label>Lightness Boost (0 - 50):</label>
-                    <input type="number" id="boostInput" name="lightness_boost" value="25" step="1">
-                </div>
-                <div class="form-group">
-                    <label>Whitening Tone Shift (0 - 30):</label>
-                    <input type="number" id="toneInput" name="whitening_tone" value="10" step="1">
-                </div>
-                <div class="form-group">
-                    <label>Smooth Skin:</label>
-                    <select id="smoothInput" name="smooth_skin">
-                        <option value="true" selected>True</option>
-                        <option value="false">False</option>
-                    </select>
-                </div>
-                <button type="submit" id="submitBtn">Process Portrait</button>
-            </form>
-            
-            <div id="loading">Processing image... Please wait.</div>
-            <div id="errorDiv"></div>
-            
-            <div class="results" id="resultsDiv" style="display:none;">
-                <div class="result-box">
-                    <h3>Original</h3>
-                    <img id="origImg" />
-                </div>
-                <div class="result-box">
-                    <h3>Lightened & Refined</h3>
-                    <img id="procImg" />
-                </div>
-            </div>
-        </div>
+    return """<!doctype html><html><head><title>Portrait Complexion Lightener</title>
+<style>body{font-family:Arial;margin:40px;background:#f4f4f9;color:#333}.container{max-width:700px;margin:auto;background:#fff;padding:30px;border-radius:8px}label{display:block;font-weight:bold;margin-top:16px}input,select{width:100%;box-sizing:border-box;padding:8px}button{margin-top:20px;background:#0878d1;color:#fff;border:0;padding:11px 18px;border-radius:4px}.results{display:flex;gap:20px;flex-wrap:wrap;margin-top:25px}.result-box{max-width:320px}img{max-width:100%;border:1px solid #ddd}#error{color:#b00020;white-space:pre-wrap;margin-top:15px}</style>
+</head><body><div class=container><h1>Portrait Complexion Lightener</h1><p>Large photos are safely resized for fast web output.</p><form id=f><label>Portrait image<input name=file type=file accept="image/jpeg,image/png,image/webp" required></label><label>Lightness boost (0–50)<input name=lightness_boost type=number value=25 min=0 max=50></label><label>Whitening tone shift (0–30)<input name=whitening_tone type=number value=10 min=0 max=30></label><label>Smooth skin<select name=smooth_skin><option value=true selected>True</option><option value=false>False</option></select></label><button>Process portrait</button></form><div id=error></div><div id=r class=results hidden><div class=result-box><h3>Original</h3><img id=o></div><div class=result-box><h3>Processed</h3><img id=p></div></div></div><script>f.onsubmit=async e=>{e.preventDefault();error.textContent='Processing…';r.hidden=true;let d=new FormData(f),x=d.get('file');o.src=URL.createObjectURL(x);try{let q=await fetch('/process',{method:'POST',body:d});if(!q.ok)throw Error(await q.text());p.src=URL.createObjectURL(await q.blob());r.hidden=false;error.textContent=''}catch(z){error.textContent=z.message}}</script></body></html>"""
 
-        <script>
-            document.getElementById('uploadForm').addEventListener('submit', async function(e) {
-                e.preventDefault();
-                const fileInput = document.getElementById('fileInput');
-                if (fileInput.files.length === 0) return;
-                
-                const errorDiv = document.getElementById('errorDiv');
-                const resultsDiv = document.getElementById('resultsDiv');
-                const loadingDiv = document.getElementById('loading');
-                
-                errorDiv.style.display = 'none';
-                errorDiv.innerText = '';
-                resultsDiv.style.display = 'none';
-                loadingDiv.style.display = 'block';
-                
-                const file = fileInput.files[0];
-                const origUrl = URL.createObjectURL(file);
-                document.getElementById('origImg').src = origUrl;
-                
-                const formData = new FormData();
-                formData.append('file', file);
-                formData.append('lightness_boost', document.getElementById('boostInput').value);
-                formData.append('whitening_tone', document.getElementById('toneInput').value);
-                formData.append('smooth_skin', document.getElementById('smoothInput').value);
-                
-                try {
-                    const response = await fetch('/process', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    loadingDiv.style.display = 'none';
-                    
-                    if (response.ok) {
-                        const blob = await response.blob();
-                        const procUrl = URL.createObjectURL(blob);
-                        document.getElementById('procImg').src = procUrl;
-                        resultsDiv.style.display = 'flex';
-                    } else {
-                        const errText = await response.text();
-                        let errorMsg = errText;
-                        try {
-                            const errJson = JSON.parse(errText);
-                            if (errJson.detail) {
-                                errorMsg = typeof errJson.detail === 'object' ? JSON.stringify(errJson.detail, null, 2) : errJson.detail;
-                            }
-                        } catch (err) {}
-                        errorDiv.innerText = "Server Error (" + response.status + "):\\n" + errorMsg;
-                        errorDiv.style.display = 'block';
-                    }
-                } catch (err) {
-                    loadingDiv.style.display = 'none';
-                    errorDiv.innerText = "Network or Client Error:\\n" + err.message;
-                    errorDiv.style.display = 'block';
-                }
-            });
-        </script>
-    </body>
-    </html>
-    """
 
 @app.post("/process")
-async def process_image(
-    file: UploadFile = File(...),
-    lightness_boost: float = Form(25.0),
-    whitening_tone: float = Form(10.0),
-    smooth_skin: bool = Form(True)
-):
+async def process_image(file: UploadFile = File(...), lightness_boost: float = Form(25.0),
+                        whitening_tone: float = Form(10.0), smooth_skin: bool = Form(True)):
+    if not 0 <= lightness_boost <= 50 or not 0 <= whitening_tone <= 30:
+        raise HTTPException(status_code=422, detail="Boost must be 0–50 and tone shift must be 0–30.")
     try:
-        contents = await file.read()
+        # Read at most one byte beyond the limit; UploadFile itself is spooled to disk.
+        contents = await file.read(MAX_UPLOAD_BYTES + 1)
         if not contents:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise HTTPException(status_code=400, detail="Failed to decode image file. Please ensure it is a valid JPEG/PNG image.")
-            
-        processed = lighten_complexion(img, lightness_boost=lightness_boost, whitening_tone=whitening_tone, smooth_skin=smooth_skin)
-        
-        success, encoded_img = cv2.imencode('.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if not success:
-            raise HTTPException(status_code=500, detail="Image encoding failed during JPEG compression.")
-            
-        return Response(content=encoded_img.tobytes(), media_type="image/jpeg")
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        tb_str = "".join(traceback.format_exception(exc_type, exc_obj, exc_tb))
-        print(f"Unhandled exception in /process: {e}\\n{tb_str}", file=sys.stderr)
-        raise HTTPException(status_code=500, detail=f"{str(e)}\\n\\nTraceback:\\n{tb_str}")
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Upload is too large (maximum 12 MB).")
+        _validate_image_header(contents)
+        encoded = np.frombuffer(contents, dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        del encoded, contents
+        if image is None:
+            raise HTTPException(status_code=400, detail="Could not decode this image.")
+        image = _web_size(image)
+        processed = lighten_complexion(image, lightness_boost, whitening_tone, smooth_skin)
+        ok, response_image = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not ok:
+            raise HTTPException(status_code=500, detail="Image encoding failed.")
+        return Response(response_image.tobytes(), media_type="image/jpeg")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("Processing failure:\n" + traceback.format_exc(), file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Image processing failed.") from exc
+    finally:
+        with suppress(Exception):
+            await file.close()
